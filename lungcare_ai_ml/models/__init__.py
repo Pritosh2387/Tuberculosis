@@ -7,6 +7,13 @@ commonly used symbols from each sub-package.
 
 from __future__ import annotations
 
+# Apply the torch/transformers pytree compatibility shim before any import
+# that transitively loads ``transformers`` via ``torchvision`` (see
+# :mod:`utils.torch_compat`).  Idempotent and a no-op on modern torch.
+from utils.torch_compat import ensure_pytree_compat as _ensure_pytree_compat
+
+_ensure_pytree_compat()
+
 from typing import Any
 
 from models.classification import (

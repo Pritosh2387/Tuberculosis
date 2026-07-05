@@ -28,6 +28,7 @@ import pandas as pd
 import torch
 
 from datasets.base_dataset import BaseDataset
+from datasets.transforms import build_transforms
 
 try:
     import albumentations as A
@@ -148,7 +149,7 @@ class SegmentationDataset(BaseDataset):
 
     def __init__(
         self,
-        dataframe: pd.DataFrame,
+        dataframe: pd.DataFrame | None = None,
         image_col: str = "image_path",
         mask_col: str | None = "mask_path",
         rle_col: str | None = None,
@@ -161,7 +162,59 @@ class SegmentationDataset(BaseDataset):
         cache_dir: Path | str | None = None,
         image_channels: int = 1,
         fallback_size: tuple[int, int] = (256, 256),
+        *,
+        csv_path: Path | str | None = None,
+        image_size: int | tuple[int, int] | None = None,
+        split: str | None = None,
+        split_col: str = "split",
+        in_channels: int | None = None,
     ) -> None:
+        """
+        Two initialisation styles are supported (fully backward compatible):
+
+        1. **DataFrame** (original): ``SegmentationDataset(dataframe, ...)``.
+        2. **CSV manifest** (new): ``SegmentationDataset(csv_path=..., image_size=...,
+           split=..., in_channels=...)``.  When *image_size* is given and no
+           explicit *transform* is passed, a default segmentation pipeline
+           (``Resize → Normalize → ToTensorV2`` with a paired ``mask`` target)
+           is built for *split*.
+
+        Args:
+            csv_path: Path to a CSV manifest with ``image_path`` and ``mask_path``.
+            image_size: Target ``int`` or ``(H, W)`` for the default transform.
+            split: Split name — selects train augmentation vs deterministic
+                val/test transforms (and filters rows if *split_col* exists).
+            in_channels: Alias for *image_channels* (1 = greyscale, 3 = RGB).
+        """
+        if in_channels is not None:
+            image_channels = in_channels
+
+        # ── Resolve DataFrame from csv_path when needed ───────────────────────
+        if dataframe is None:
+            if csv_path is None:
+                raise ValueError(
+                    "SegmentationDataset requires either 'dataframe' or 'csv_path'."
+                )
+            df = pd.read_csv(csv_path)
+            if split is not None and split_col in df.columns:
+                df = df[df[split_col] == split].reset_index(drop=True)
+            dataframe = df
+
+        # ── Build a default segmentation transform when a size is provided ────
+        if transform is None and image_size is not None:
+            transform = build_transforms(
+                split=split or "val",
+                image_size=image_size,
+                channels=image_channels,
+                is_segmentation=True,
+            )
+            if fallback_size == (256, 256):
+                fallback_size = (
+                    (image_size, image_size)
+                    if isinstance(image_size, int)
+                    else (int(image_size[0]), int(image_size[1]))
+                )
+
         super().__init__(
             transform=transform,
             cache=cache,

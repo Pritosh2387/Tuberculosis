@@ -93,6 +93,70 @@ def build_transform(
     return A.Compose(transforms, **compose_kwargs)
 
 
+def build_transforms(
+    split: str = "val",
+    image_size: int | tuple[int, int] = 224,
+    channels: int = 3,
+    is_segmentation: bool = False,
+    mean: list[float] | None = None,
+    std: list[float] | None = None,
+) -> A.Compose:
+    """
+    Build a self-contained Albumentations pipeline without a YAML config.
+
+    This is the convenience entry point used by the datasets and the test
+    suite.  For ``split='train'`` a light, geometry-preserving augmentation
+    (horizontal flip) is prepended; ``'val'`` / ``'test'`` are deterministic
+    (``Resize → Normalize → ToTensorV2`` only).
+
+    Args:
+        split: ``'train'``, ``'val'``, or ``'test'``.  Train adds augmentation.
+        image_size: Target size as an ``int`` (square) or ``(height, width)``.
+        channels: Number of image channels — selects ImageNet (3) or
+            single-channel (1) normalisation statistics.
+        is_segmentation: When ``True``, registers ``mask`` as an additional
+            target so geometric transforms apply identically to image and mask.
+        mean: Override normalisation mean.  Defaults to ImageNet / 0.5 by channel.
+        std: Override normalisation std.  Defaults to ImageNet / 0.5 by channel.
+
+    Returns:
+        A ready-to-call :class:`albumentations.Compose` pipeline whose output
+        ``image`` is a ``(C, H, W)`` float tensor.
+    """
+    if isinstance(image_size, int):
+        height = width = image_size
+    else:
+        height, width = int(image_size[0]), int(image_size[1])
+
+    if mean is None or std is None:
+        if channels == 1:
+            mean, std = [0.5], [0.5]
+        else:
+            mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
+    transforms: list[A.BasicTransform] = []
+    if split == "train":
+        # Geometry-preserving augmentation keeps image/mask alignment intact.
+        transforms.append(A.HorizontalFlip(p=0.5))
+    transforms.extend(
+        [
+            A.Resize(height=height, width=width),
+            A.Normalize(mean=mean, std=std, max_pixel_value=255.0),
+            ToTensorV2(),
+        ]
+    )
+
+    compose_kwargs: dict[str, Any] = {}
+    if is_segmentation:
+        compose_kwargs["additional_targets"] = {"mask": "mask"}
+
+    logger.debug(
+        "build_transforms | split=%s | size=%dx%d | channels=%d | seg=%s",
+        split, height, width, channels, is_segmentation,
+    )
+    return A.Compose(transforms, **compose_kwargs)
+
+
 def _pick_split(
     split_cfg: AugmentationSplitConfig,
     split: str,

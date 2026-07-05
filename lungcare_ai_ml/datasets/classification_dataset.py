@@ -33,7 +33,7 @@ import pandas as pd
 import torch
 
 from datasets.base_dataset import BaseDataset
-from datasets.transforms import get_identity_transform
+from datasets.transforms import build_transforms, get_identity_transform
 
 try:
     import albumentations as A
@@ -50,6 +50,20 @@ _DEFAULT_CLASSES = [
     "Lung Cancer",
     "Pulmonary Fibrosis",
 ]
+
+
+def _default_classes(num_classes: int) -> list[str]:
+    """
+    Return an ordered class list of length *num_classes*.
+
+    Uses the canonical LungCare disease order for the first six classes so
+    string labels such as ``"Healthy"`` / ``"Tuberculosis"`` map to stable
+    indices, then falls back to numeric names for any extra classes.
+    """
+    if num_classes <= len(_DEFAULT_CLASSES):
+        return _DEFAULT_CLASSES[:num_classes]
+    extra = [str(i) for i in range(len(_DEFAULT_CLASSES), num_classes)]
+    return _DEFAULT_CLASSES + extra
 
 
 class ClassificationDataset(BaseDataset):
@@ -76,7 +90,7 @@ class ClassificationDataset(BaseDataset):
 
     def __init__(
         self,
-        dataframe: pd.DataFrame,
+        dataframe: pd.DataFrame | None = None,
         image_col: str = "image_path",
         label_col: str | list[str] = "label",
         classes: list[str] | None = None,
@@ -86,7 +100,72 @@ class ClassificationDataset(BaseDataset):
         cache_dir: Path | str | None = None,
         image_channels: int = 3,
         fallback_size: tuple[int, int] = (224, 224),
+        *,
+        csv_path: Path | str | None = None,
+        image_size: int | tuple[int, int] | None = None,
+        split: str | None = None,
+        split_col: str = "split",
+        num_classes: int | None = None,
+        class_names: list[str] | None = None,
+        in_channels: int | None = None,
     ) -> None:
+        """
+        Two initialisation styles are supported (fully backward compatible):
+
+        1. **DataFrame** (original): ``ClassificationDataset(dataframe, ...)``.
+        2. **CSV manifest** (new): ``ClassificationDataset(csv_path=..., image_size=...,
+           split=..., num_classes=..., task=..., class_names=...)``.  When
+           *image_size* is given and no explicit *transform* is passed, a default
+           ``Resize → Normalize → ToTensorV2`` pipeline is built for *split*.
+
+        Args:
+            csv_path: Path to a CSV manifest.  Loaded into a DataFrame; rows are
+                filtered to *split* only when a *split_col* column is present.
+            image_size: Target ``int`` or ``(H, W)`` used to build a default
+                transform when *transform* is ``None``.
+            split: Split name — selects train augmentation vs deterministic
+                val/test transforms (and filters rows if *split_col* exists).
+            num_classes: Number of classes; when *class_names* is omitted the
+                canonical LungCare class order is used to build the label map.
+            class_names: Explicit ordered class names (alias for *classes*).
+            in_channels: Alias for *image_channels*.
+        """
+        if in_channels is not None:
+            image_channels = in_channels
+
+        # ── Resolve DataFrame from csv_path when needed ───────────────────────
+        if dataframe is None:
+            if csv_path is None:
+                raise ValueError(
+                    "ClassificationDataset requires either 'dataframe' or 'csv_path'."
+                )
+            df = pd.read_csv(csv_path)
+            if split is not None and split_col in df.columns:
+                df = df[df[split_col] == split].reset_index(drop=True)
+            dataframe = df
+
+        # ── Resolve class list from class_names / num_classes ─────────────────
+        if classes is None:
+            if class_names is not None:
+                classes = list(class_names)
+            elif num_classes is not None:
+                classes = _default_classes(num_classes)
+
+        # ── Build a default transform when an image size is provided ──────────
+        if transform is None and image_size is not None:
+            transform = build_transforms(
+                split=split or "val",
+                image_size=image_size,
+                channels=image_channels,
+                is_segmentation=False,
+            )
+            if fallback_size == (224, 224):
+                fallback_size = (
+                    (image_size, image_size)
+                    if isinstance(image_size, int)
+                    else (int(image_size[0]), int(image_size[1]))
+                )
+
         super().__init__(
             transform=transform,
             cache=cache,
@@ -212,13 +291,15 @@ class ClassificationDataset(BaseDataset):
                     "is_corrupted": True,
                 },
             )
+            # Classification samples carry no mask; a ``None`` value would break
+            # ``torch.utils.data.default_collate`` when batched by a DataLoader.
+            sample.pop("mask", None)
             self._save_to_cache(idx, sample)
             return sample
 
         sample: dict[str, Any] = {
             "image": img_tensor,
             "label": label_tensor,
-            "mask": None,
             "metadata": metadata,
         }
         self._save_to_cache(idx, sample)

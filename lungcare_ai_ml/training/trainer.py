@@ -243,7 +243,7 @@ class BaseTrainer(ABC):
         ckpt_dir = config.checkpoint_dir / config.experiment_name
         self.checkpoint_manager = CheckpointManager(
             checkpoint_dir=ckpt_dir,
-            monitor_metric=config.monitor_metric,
+            monitor=config.monitor_metric,
             mode=config.monitor_mode,
             top_k=config.top_k_checkpoints,
         )

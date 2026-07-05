@@ -234,15 +234,19 @@ class SegmentationMetrics:
         self.threshold = threshold
         self.device = device
 
+        # NOTE: ``torchmetrics.Dice`` was removed in torchmetrics>=1.6.  For
+        # segmentation the Dice coefficient is identical to the F1 score
+        # (2·TP / (2·TP + FP + FN)), so F1Score is used as a drop-in that keeps
+        # the ``dice`` output key and is available across torchmetrics versions.
         if num_classes == 1:
             tm_task = "binary"
-            self._dice = torchmetrics.Dice(average="micro").to(device)
+            self._dice = torchmetrics.F1Score(task="binary").to(device)
             self._iou = torchmetrics.JaccardIndex(task="binary").to(device)
             self._acc = torchmetrics.Accuracy(task="binary").to(device)
         else:
             tm_task = "multiclass"
-            self._dice = torchmetrics.Dice(
-                num_classes=num_classes, average="macro"
+            self._dice = torchmetrics.F1Score(
+                task="multiclass", num_classes=num_classes, average="macro"
             ).to(device)
             self._iou = torchmetrics.JaccardIndex(
                 task="multiclass", num_classes=num_classes

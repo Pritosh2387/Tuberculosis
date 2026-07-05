@@ -2,6 +2,13 @@
 Public API for the LungCare AI ``training`` package.
 """
 
+# Apply the torch/transformers pytree compatibility shim before any import
+# that transitively loads ``transformers`` via ``torchmetrics`` (see
+# :mod:`utils.torch_compat`).  Idempotent and a no-op on modern torch.
+from utils.torch_compat import ensure_pytree_compat as _ensure_pytree_compat
+
+_ensure_pytree_compat()
+
 from training.classification_trainer import ClassificationConfig, ClassificationTrainer
 from training.losses import (
     BCEDiceLoss,

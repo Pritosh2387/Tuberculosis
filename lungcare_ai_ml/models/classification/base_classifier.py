@@ -77,7 +77,7 @@ class BaseClassifier(nn.Module, ABC):
     # ─── Inference helpers ────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
         """
         Run a forward pass and return class probabilities.
 
@@ -95,6 +95,42 @@ class BaseClassifier(nn.Module, ABC):
         return torch.softmax(logits, dim=1)
 
     @torch.no_grad()
+    def predict(self, x: torch.Tensor, threshold: float = 0.5) -> dict[str, torch.Tensor]:
+        """
+        Run inference and return a structured prediction summary.
+
+        Args:
+            x: Input image tensor ``(B, C, H, W)``.
+            threshold: Decision threshold for binary / multilabel tasks.
+
+        Returns:
+            Dict with:
+            - ``'pred_class'``: predicted class index ``(B,)`` for multiclass,
+              or a ``(B, num_classes)`` binary indicator for binary/multilabel.
+            - ``'confidence'``: probability of the predicted class(es).
+            - ``'probabilities'``: full probability tensor from
+              :meth:`predict_proba`.
+
+        Note:
+            Raw probability tensors remain available via :meth:`predict_proba`.
+        """
+        probs = self.predict_proba(x)
+        if self.task == "multiclass":
+            confidence, pred_class = probs.max(dim=1)
+        elif self.task == "binary":
+            pos = probs.squeeze(-1) if probs.ndim > 1 else probs
+            pred_class = (pos >= threshold).long()
+            confidence = torch.where(pos >= threshold, pos, 1.0 - pos)
+        else:  # multilabel
+            pred_class = (probs >= threshold).long()
+            confidence = probs
+        return {
+            "pred_class": pred_class,
+            "confidence": confidence,
+            "probabilities": probs,
+        }
+
+    @torch.no_grad()
     def predict_class(self, x: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
         """
         Return predicted class index / binary vector.
@@ -107,7 +143,7 @@ class BaseClassifier(nn.Module, ABC):
             - ``'multiclass'``: ``(B,)`` long tensor of class indices.
             - ``'binary'`` / ``'multilabel'``: ``(B, num_classes)`` long tensor.
         """
-        probs = self.predict(x)
+        probs = self.predict_proba(x)
         if self.task == "multiclass":
             return probs.argmax(dim=1)
         return (probs >= threshold).long()

@@ -179,6 +179,11 @@ class UNet(nn.Module):
             skip_feats.append(x)
             x = down(x)
 
+        # The feature map feeding the bottleneck is also a skip connection
+        # (channels ``f[-1]``); without it the decoder would have one more Up
+        # block than available skips, causing a channel mismatch on concat.
+        skip_feats.append(x)
+
         x = self.bottleneck(x)
         x = self.dropout(x)
 

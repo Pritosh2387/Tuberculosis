@@ -145,28 +145,66 @@ class CheckpointManager:
 
     def save(
         self,
-        state: dict[str, Any],
-        epoch: int,
-        metrics: dict[str, float],
+        state: dict[str, Any] | None = None,
+        epoch: int = 0,
+        metrics: dict[str, float] | None = None,
         filename: str | None = None,
+        *,
+        model: Any = None,
+        optimizer: Any = None,
+        metric_value: float | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> Path:
         """
         Save a checkpoint and update the manifest.
 
-        The *state* dict should contain at minimum:
-        ``model_state_dict``, ``optimizer_state_dict``, and optionally
-        ``scheduler_state_dict``.  The *epoch* and *metrics* are merged
-        into the saved file automatically.
+        Two calling conventions are supported:
+
+        1. **Pre-built state** (original)::
+
+               manager.save(state_dict, epoch, metrics)
+
+           where *state* contains at minimum ``model_state_dict`` /
+           ``optimizer_state_dict`` and *metrics* holds all epoch metrics.
+
+        2. **Component form** (used by :class:`~training.trainer.BaseTrainer`)::
+
+               manager.save(epoch=e, metric_value=v, model=m,
+                            optimizer=opt, extra={...})
+
+           The *state* dict is assembled from *model* / *optimizer* / *extra*
+           and *metrics* is derived from *metric_value* under the monitored key.
 
         Args:
-            state: Arbitrary state dict to persist (model, optimiser, etc.).
-            epoch: Current training epoch (1-based).
-            metrics: All metric values for this epoch.
+            state: Pre-built state dict.  If ``None`` it is assembled from
+                *model* / *optimizer* / *extra*.
+            epoch: Current training epoch.
+            metrics: All metric values for this epoch.  If ``None`` it is
+                derived from *metric_value*.
             filename: Custom filename.  Auto-generated if ``None``.
+            model: Model whose ``state_dict`` is saved (component form).
+            optimizer: Optimizer whose ``state_dict`` is saved (component form).
+            metric_value: Value of the monitored metric (component form).
+            extra: Additional key/value pairs merged into the saved state.
 
         Returns:
             Absolute :class:`pathlib.Path` to the saved checkpoint.
         """
+        # ── Assemble state / metrics from component form when needed ──────────
+        if state is None:
+            state = {}
+            if model is not None:
+                state["model_state_dict"] = model.state_dict()
+            if optimizer is not None:
+                state["optimizer_state_dict"] = optimizer.state_dict()
+        if extra:
+            state = {**state, **extra}
+
+        if metrics is None:
+            metrics = {}
+            if metric_value is not None:
+                metrics[self.monitor] = float(metric_value)
+
         fname = filename or self._auto_filename(epoch, metrics)
         save_path = self.checkpoint_dir / fname
 
