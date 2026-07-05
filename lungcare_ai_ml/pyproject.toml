@@ -1,0 +1,242 @@
+[build-system]
+requires = ["setuptools>=71.0.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "lungcare-ai"
+version = "1.0.0"
+description = "Explainable deep learning system for chest X-ray and CT scan analysis"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "LungCare AI Team" }]
+requires-python = ">=3.12"
+keywords = [
+    "medical-imaging",
+    "deep-learning",
+    "chest-xray",
+    "tuberculosis",
+    "pneumonia",
+    "covid-19",
+    "lung-cancer",
+    "explainable-ai",
+    "grad-cam",
+    "segmentation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Typing :: Typed",
+]
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "configs*",
+    "datasets*",
+    "models*",
+    "training*",
+    "evaluation*",
+    "inference*",
+    "services*",
+    "utils*",
+]
+exclude = ["tests*", "docs*", "scripts*", "data*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.json", "*.toml"]
+
+# ─── Black ───────────────────────────────────────────────────────────────────
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.mypy_cache
+  | \.ruff_cache
+  | \.venv
+  | __pycache__
+  | build
+  | dist
+  | data
+)/
+'''
+
+# ─── Ruff ────────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "data",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C90", # mccabe complexity
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific rules
+    "PTH", # use pathlib
+    "LOG", # logging correctness
+]
+ignore = [
+    "E501",  # Line too long — handled by black
+    "B008",  # Function call in default arg — common in Pydantic
+    "N812",  # Lowercase imported as non-lowercase (e.g. import torch.nn as nn)
+    "N817",  # CamelCase imported as acronym (e.g. import torch.nn.functional as F)
+    "SIM108", # Use ternary operator — less readable in ML code
+    "RUF012", # Mutable class attributes — used in dataclasses
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "N806"]  # Allow assert and local uppercase vars in tests
+"scripts/*" = ["T201"]        # Allow print in scripts
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.lint.isort]
+known-third-party = [
+    "torch",
+    "torchvision",
+    "timm",
+    "cv2",
+    "albumentations",
+    "monai",
+    "wandb",
+    "pydicom",
+    "SimpleITK",
+    "sklearn",
+    "scipy",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "PIL",
+    "pydantic",
+    "yaml",
+]
+known-first-party = [
+    "datasets",
+    "models",
+    "training",
+    "evaluation",
+    "inference",
+    "services",
+    "utils",
+]
+force-sort-within-sections = true
+
+# ─── Mypy ────────────────────────────────────────────────────────────────────
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+show_error_codes = true
+pretty = true
+exclude = ["data/", "build/", "dist/"]
+
+[[tool.mypy.overrides]]
+module = [
+    "cv2.*",
+    "albumentations.*",
+    "monai.*",
+    "pydicom.*",
+    "SimpleITK.*",
+    "sklearn.*",
+    "scipy.*",
+    "matplotlib.*",
+    "seaborn.*",
+    "wandb.*",
+    "timm.*",
+    "h5py.*",
+    "imageio.*",
+    "skimage.*",
+    "gdown.*",
+    "tensorboard.*",
+]
+ignore_missing_imports = true
+
+# ─── Pytest ──────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--verbose",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "slow: marks tests as slow — run with -m slow",
+    "cuda: marks tests requiring a CUDA-capable GPU",
+    "integration: marks full-pipeline integration tests",
+    "unit: marks pure unit tests with no I/O",
+]
+filterwarnings = [
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]
+
+# ─── Coverage ────────────────────────────────────────────────────────────────
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "scripts/*",
+    "docs/*",
+    "data/*",
+    "setup.py",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "@(abc\\.)?abstractmethod",
+]

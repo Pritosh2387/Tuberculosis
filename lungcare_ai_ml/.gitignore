@@ -1,0 +1,178 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.pyo
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ─── Virtual Environments ────────────────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# ─── PyInstaller ─────────────────────────────────────────────────────────────
+*.manifest
+*.spec
+
+# ─── Distribution / Packaging ────────────────────────────────────────────────
+.Python
+build/
+dist/
+*.egg-info/
+
+# ─── Unit Test / Coverage ────────────────────────────────────────────────────
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+nosetests.xml
+test-results/
+
+# ─── Type Checking ───────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# ─── Linting ─────────────────────────────────────────────────────────────────
+.ruff_cache/
+
+# ─── Jupyter / IPython ───────────────────────────────────────────────────────
+.ipynb_checkpoints
+*.ipynb
+profile_default/
+ipython_config.py
+
+# ─── Data ────────────────────────────────────────────────────────────────────
+data/raw/
+data/processed/
+data/cache/
+data/healthy_references/
+# Keep split CSVs and directory stubs
+!data/splits/
+!data/splits/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/cache/.gitkeep
+!data/healthy_references/.gitkeep
+
+# ─── Model Checkpoints & Weights ─────────────────────────────────────────────
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.bin
+*.safetensors
+
+# ─── Experiment Outputs ───────────────────────────────────────────────────────
+outputs/
+logs/
+runs/
+wandb/
+mlruns/
+*.log
+
+# ─── TensorBoard ─────────────────────────────────────────────────────────────
+events.out.tfevents.*
+tf_logs/
+
+# ─── DICOM & Medical Images ──────────────────────────────────────────────────
+*.dcm
+*.dicom
+*.nii
+*.nii.gz
+*.mhd
+*.mha
+*.nrrd
+
+# ─── Large Image Formats ─────────────────────────────────────────────────────
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.tif
+*.bmp
+# Keep documentation images
+!docs/**/*.png
+!docs/**/*.jpg
+!README_assets/
+
+# ─── Secrets & Credentials ───────────────────────────────────────────────────
+.env
+.env.*
+*.env
+secrets.yaml
+secrets.json
+kaggle.json
+wandb_key.txt
+
+# ─── OS Artifacts ────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ─── IDEs & Editors ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+*~
+
+# ─── C Extensions ────────────────────────────────────────────────────────────
+*.c
+*.cpp
+*.o
+
+# ─── Temporary Files ─────────────────────────────────────────────────────────
+tmp/
+temp/
+.tmp/
+*.tmp
+*.temp
+*.bak
+*.backup
