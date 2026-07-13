@@ -101,37 +101,6 @@ class TestBCEDiceLoss:
         assert logits.grad is not None
 
 
-class TestDeepSupervisionLoss:
-    def test_list_input(self) -> None:
-        from training.losses import BCEDiceLoss, DeepSupervisionLoss
-
-        base = BCEDiceLoss()
-        ds_loss = DeepSupervisionLoss(criterion=base)
-        outputs = [torch.randn(2, 1, h, h) for h in (16, 32, 64)]
-        target = torch.randint(0, 2, (2, 1, 64, 64)).float()
-        loss = ds_loss(outputs, target)
-        assert loss.item() >= 0
-
-    def test_single_tensor_passthrough(self) -> None:
-        from training.losses import BCEDiceLoss, DeepSupervisionLoss
-
-        base = BCEDiceLoss()
-        ds_loss = DeepSupervisionLoss(criterion=base)
-        output = torch.randn(2, 1, 64, 64)
-        target = torch.randint(0, 2, (2, 1, 64, 64)).float()
-        loss = ds_loss(output, target)
-        assert loss.item() >= 0
-
-    def test_custom_weights_sum_to_one(self) -> None:
-        from training.losses import BCEDiceLoss, DeepSupervisionLoss
-
-        base = BCEDiceLoss()
-        ds_loss = DeepSupervisionLoss(criterion=base, weights=[1.0, 2.0, 3.0])
-        outputs = [torch.zeros(1, 1, h, h) for h in (16, 32, 64)]
-        target = torch.zeros(1, 1, 64, 64)
-        # All zeros → expect very small loss
-        loss = ds_loss(outputs, target)
-        assert loss.item() >= 0
 
 
 class TestBuildFactories:

@@ -1,193 +1,194 @@
 """
-Abstract base trainer for LungCare AI.
+training/trainer.py
+────────────────────
+Unified training engine for LungCare AI.
 
-Provides a production-grade training loop with:
+Supports both classification and segmentation in a single concrete
+class — no abstract base class, no subclasses.
 
-- Single-GPU and :class:`~torch.nn.DataParallel` multi-GPU support.
-- Automatic Mixed Precision (``torch.amp``).
-- Gradient accumulation across N steps before an optimizer update.
-- Gradient clipping by global norm.
-- Early stopping with configurable patience and mode.
-- Full checkpoint resume: model, optimizer, scheduler, scaler.
-- CSV logging per epoch.
-- Optional TensorBoard logging (requires ``tensorboard`` package).
+Features
+--------
+- Automatic Mixed Precision (torch.amp.autocast + GradScaler)
+- Gradient clipping by global norm
+- Early stopping with configurable patience and metric mode
+- TensorBoard logging (per-epoch scalars)
+- CSV logging (append-mode, one row per epoch)
+- Checkpoint save/load (best model + latest)
+- Cosine, step, and plateau LR schedulers
+
+Interview notes
+---------------
+Why a concrete class instead of an abstract base?
+  The abstract BaseTrainer + two subclasses (ClassificationTrainer +
+  SegmentationTrainer) added 1200 lines to handle the same training
+  loop with minor task-specific differences. Those differences
+  (loss function + metric collection) are now constructor arguments,
+  which is simpler and more Pythonic.
+
+Why GradScaler only on CUDA?
+  AMP reduces float32 to float16 for matmuls, which can underflow
+  to zero for small gradients. GradScaler multiplies the loss by a
+  large factor before backward(), then divides before optimizer.step()
+  to prevent underflow. On CPU, float16 is not natively supported so
+  AMP + GradScaler are both disabled.
 """
-
 from __future__ import annotations
 
 import csv
 import logging
+import random
 import time
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from pydantic import BaseModel, Field
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 
-from training.schedulers import build_scheduler, is_step_scheduler
-from utils.checkpoint import CheckpointManager
 
 logger = logging.getLogger("lungcare.training.trainer")
 
 
-# ─── Pydantic config models ───────────────────────────────────────────────────
+# ─── Checkpoint helpers ───────────────────────────────────────────────────────
 
 
-class OptimizerConfig(BaseModel):
-    name: str = "adamw"
-    lr: float = 1e-4
-    weight_decay: float = 1e-2
-    betas: tuple[float, float] = (0.9, 0.999)
-    eps: float = 1e-8
-    momentum: float = 0.9
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    metrics: dict[str, float],
+    config_dict: dict[str, Any],
+) -> None:
+    """
+    Save a training checkpoint to *path*.
+
+    Checkpoint dict schema
+    ----------------------
+    ``model_state``      : model.state_dict()
+    ``optimizer_state``  : optimizer.state_dict()
+    ``epoch``            : current epoch (int)
+    ``metrics``          : val metrics dict
+    ``config``           : config snapshot for reproducibility
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model_state":     model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "epoch":           epoch,
+        "metrics":         metrics,
+        "config":          config_dict,
+    }, path)
+    logger.info("Checkpoint saved → %s (epoch=%d)", path.name, epoch)
 
 
-class SchedulerConfig(BaseModel):
-    name: str = "warmup_cosine"
-    T_max: int = 100
-    eta_min: float = 1e-6
-    warmup_epochs: int = 5
-    eta_min_ratio: float = 0.0
-    T_0: int = 10
-    T_mult: int = 2
-    step_size: int = 30
-    gamma: float = 0.1
-    milestones: list[int] = []
-    factor: float = 0.5
-    patience: int = 10
-    mode: str = "max"
-    max_lr: float = 1e-3
-    pct_start: float = 0.3
+def load_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
+    device: str | torch.device = "cpu",
+) -> dict[str, Any]:
+    """
+    Load a checkpoint into *model* (and optionally *optimizer*).
+
+    Args:
+        path:      Path to the ``.pth`` file.
+        model:     Model to load weights into.
+        optimizer: If provided, restores optimizer state too.
+        device:    Map location for tensors.
+
+    Returns:
+        The full checkpoint dict (epoch, metrics, config).
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
+    if optimizer and "optimizer_state" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    logger.info("Checkpoint loaded ← %s (epoch=%d)", path.name, ckpt.get("epoch", "?"))
+    return ckpt
 
 
-class EarlyStoppingConfig(BaseModel):
-    enabled: bool = True
-    patience: int = 15
-    min_delta: float = 1e-4
-    mode: str = "max"   # 'max' for metrics like F1/Dice, 'min' for loss
-
-
-class TrainerConfig(BaseModel):
-    task: str = "multiclass"
-    num_classes: int = 6
-    epochs: int = 100
-    amp: bool = True
-    grad_clip: float = 1.0
-    grad_accum_steps: int = 1
-    data_parallel: bool = False
-    log_dir: Path = Path("logs")
-    checkpoint_dir: Path = Path("checkpoints")
-    experiment_name: str = "experiment"
-    save_every_n_epochs: int = 5
-    resume_from: Path | None = None
-    monitor_metric: str = "val_f1_macro"
-    monitor_mode: str = "max"   # 'max' → higher is better
-    top_k_checkpoints: int = 3
-    optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
-    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
-    early_stopping: EarlyStoppingConfig = Field(default_factory=EarlyStoppingConfig)
-
-
-# ─── Utilities ────────────────────────────────────────────────────────────────
+# ─── Early stopping ───────────────────────────────────────────────────────────
 
 
 class EarlyStopping:
     """
-    Monitors a scalar metric and triggers when no improvement is seen
-    for *patience* consecutive epochs.
+    Stop training when a monitored metric stops improving.
 
     Args:
-        patience: Epochs to wait after last improvement.
-        min_delta: Minimum absolute change to be considered an improvement.
-        mode: ``'max'`` (higher = better) or ``'min'`` (lower = better).
+        patience:  Epochs to wait after the last improvement.
+        min_delta: Minimum change to qualify as an improvement.
+        mode:      ``'max'`` (higher = better) or ``'min'`` (lower = better).
     """
 
     def __init__(
         self,
-        patience: int = 15,
+        patience: int = 10,
         min_delta: float = 1e-4,
         mode: str = "max",
     ) -> None:
-        self.patience = patience
+        self.patience  = patience
         self.min_delta = min_delta
-        self.mode = mode
-        self.counter: int = 0
-        self.best_value: float = float("-inf") if mode == "max" else float("inf")
-        self.triggered: bool = False
+        self.mode      = mode
+        self.counter   = 0
+        self.best      = float("-inf") if mode == "max" else float("inf")
+        self.triggered = False
 
     def __call__(self, value: float) -> bool:
-        """
-        Update state with the latest metric value.
-
-        Returns:
-            ``True`` if training should stop.
-        """
-        if self._is_improvement(value):
-            self.best_value = value
+        improved = (
+            value > self.best + self.min_delta
+            if self.mode == "max"
+            else value < self.best - self.min_delta
+        )
+        if improved:
+            self.best    = value
             self.counter = 0
         else:
             self.counter += 1
-
-        if self.counter >= self.patience:
-            self.triggered = True
-
+            if self.counter >= self.patience:
+                self.triggered = True
         return self.triggered
 
-    def _is_improvement(self, value: float) -> bool:
-        if self.mode == "max":
-            return value > self.best_value + self.min_delta
-        return value < self.best_value - self.min_delta
 
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "counter": self.counter,
-            "best_value": self.best_value,
-            "triggered": self.triggered,
-        }
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        self.counter = state["counter"]
-        self.best_value = state["best_value"]
-        self.triggered = state["triggered"]
+# ─── CSV logger ───────────────────────────────────────────────────────────────
 
 
 class _CSVLogger:
-    """Append-mode CSV logger; creates the file and header on first call."""
+    """Append-mode CSV logger — one row per epoch."""
 
-    def __init__(self, filepath: Path, fieldnames: list[str]) -> None:
-        self.filepath = filepath
+    def __init__(self, path: Path, fieldnames: list[str]) -> None:
+        self.path       = path
         self.fieldnames = fieldnames
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w", newline="") as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
     def log(self, row: dict[str, Any]) -> None:
-        with open(self.filepath, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames, extrasaction="ignore")
-            writer.writerow(row)
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=self.fieldnames,
+                           extrasaction="ignore").writerow(row)
 
 
-# ─── Abstract base trainer ────────────────────────────────────────────────────
+# ─── Trainer ─────────────────────────────────────────────────────────────────
 
 
-class BaseTrainer(ABC):
+class Trainer:
     """
-    Abstract training loop engine.
-
-    Subclasses must implement :meth:`_train_step`, :meth:`_val_step`,
-    and :meth:`_get_monitor_value`.
+    Unified training loop for classification and segmentation.
 
     Args:
-        model: PyTorch model to train.
-        train_loader: DataLoader for the training split.
-        val_loader: DataLoader for the validation split.
-        config: :class:`TrainerConfig` instance.
-        device: Target device string or :class:`torch.device`.
+        model:          PyTorch model to train.
+        train_loader:   Training DataLoader.
+        val_loader:     Validation DataLoader.
+        criterion:      Loss function.
+        optimizer:      Pre-built optimizer (AdamW recommended).
+        config:         ``utils.config.Config`` or any object with
+                        ``training`` and ``data`` sub-configs.
+        task:           ``'multiclass'``, ``'binary'``, or ``'segmentation'``.
+        device:         Training device string or ``torch.device``.
+        experiment_name: Sub-folder name inside checkpoint_dir and log_dir.
     """
 
     def __init__(
@@ -195,361 +196,283 @@ class BaseTrainer(ABC):
         model: nn.Module,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        config: TrainerConfig,
+        criterion: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        config: Any,
+        task: str = "multiclass",
         device: str | torch.device = "cpu",
+        experiment_name: str = "run",
     ) -> None:
-        self.config = config
-        self.device = torch.device(device)
-        self._device_type: str = "cuda" if self.device.type == "cuda" else "cpu"
+        self.model        = model.to(device)
         self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.val_loader   = val_loader
+        self.criterion    = criterion
+        self.optimizer    = optimizer
+        self.config       = config
+        self.task         = task
+        self.device       = torch.device(device)
+        self._device_type = "cuda" if self.device.type == "cuda" else "cpu"
 
-        # ── Model setup ───────────────────────────────────────────────────────
-        if config.data_parallel and torch.cuda.device_count() > 1:
-            logger.info("Using DataParallel across %d GPUs.", torch.cuda.device_count())
-            self.model: nn.Module = nn.DataParallel(model)
-        else:
-            self.model = model
-        self.model.to(self.device)
-
-        # ── Optimiser ─────────────────────────────────────────────────────────
-        self.optimizer = self._build_optimizer(config.optimizer)
+        tc = config.training   # shorthand
 
         # ── AMP ───────────────────────────────────────────────────────────────
-        self._use_amp = config.amp and self._device_type == "cuda"
-        self.scaler: torch.amp.GradScaler | None = (
-            torch.amp.GradScaler(self._device_type) if self._use_amp else None
+        self._use_amp = tc.amp and self._device_type == "cuda"
+        self._scaler  = (
+            torch.amp.GradScaler(self._device_type)
+            if self._use_amp else None
         )
 
         # ── Scheduler ─────────────────────────────────────────────────────────
-        total_steps = len(train_loader) * config.epochs
-        self.scheduler = build_scheduler(
-            self.optimizer,
-            config.scheduler,
-            total_steps=total_steps,
-            total_epochs=config.epochs,
-        )
-        self._per_step_scheduler = is_step_scheduler(self.scheduler)
+        self._scheduler = self._build_scheduler(tc.scheduler, tc.epochs)
 
         # ── Early stopping ────────────────────────────────────────────────────
-        es = config.early_stopping
-        self.early_stopper = EarlyStopping(
-            patience=es.patience,
-            min_delta=es.min_delta,
-            mode=es.mode,
+        self._stopper = EarlyStopping(
+            patience=tc.patience,
+            mode=tc.monitor_mode,
         )
 
-        # ── Checkpoint manager ────────────────────────────────────────────────
-        ckpt_dir = config.checkpoint_dir / config.experiment_name
-        self.checkpoint_manager = CheckpointManager(
-            checkpoint_dir=ckpt_dir,
-            monitor=config.monitor_metric,
-            mode=config.monitor_mode,
-            top_k=config.top_k_checkpoints,
-        )
+        # ── Metrics ───────────────────────────────────────────────────────────────
+        from training.metrics import ClassificationMetrics, SegmentationMetrics  # lazy
+        class_names = getattr(config.data, "class_names", None)
+        num_classes  = getattr(config.data, "num_classes", 2)
 
-        # ── Logging ───────────────────────────────────────────────────────────
-        log_dir = config.log_dir / config.experiment_name
+        if task == "segmentation":
+            self._train_metrics: Any = SegmentationMetrics(device=self.device)
+            self._val_metrics:   Any = SegmentationMetrics(device=self.device)
+        else:
+            self._train_metrics = ClassificationMetrics(
+                num_classes=num_classes, task=task,
+                device=self.device, class_names=class_names,
+            )
+            self._val_metrics = ClassificationMetrics(
+                num_classes=num_classes, task=task,
+                device=self.device, class_names=class_names,
+            )
+
+        # ── Directories ───────────────────────────────────────────────────────
+        self._ckpt_dir = Path(tc.checkpoint_dir) / experiment_name
+        self._ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self._best_path   = self._ckpt_dir / "best.pth"
+        self._latest_path = self._ckpt_dir / "latest.pth"
+
+        # ── TensorBoard ───────────────────────────────────────────────────────
+        log_dir = Path(tc.log_dir) / experiment_name
         log_dir.mkdir(parents=True, exist_ok=True)
-        self._csv_logger: _CSVLogger | None = None  # created lazily
-
         self._tb_writer: Any = None
         try:
             from torch.utils.tensorboard import SummaryWriter
             self._tb_writer = SummaryWriter(log_dir=str(log_dir))
-            logger.info("TensorBoard writer → %s", log_dir)
+            logger.info("TensorBoard → %s", log_dir)
         except ImportError:
-            logger.warning("tensorboard not installed — skipping TensorBoard logging.")
+            logger.warning("tensorboard not installed — skipping TB logging.")
+
+        # ── CSV logger ────────────────────────────────────────────────────────
+        self._csv_logger: _CSVLogger | None = None   # lazy init on first epoch
 
         # ── State ─────────────────────────────────────────────────────────────
-        self.start_epoch: int = 0
-        self.global_step: int = 0
-
-        # ── Resume ────────────────────────────────────────────────────────────
-        if config.resume_from:
-            self.start_epoch = self._resume(Path(config.resume_from))
-
+        self._best_metric: float = float("-inf")
         logger.info(
-            "BaseTrainer | device=%s | AMP=%s | grad_accum=%d | epochs=%d",
-            self.device, self._use_amp, config.grad_accum_steps, config.epochs,
+            "Trainer | task=%s | device=%s | AMP=%s | epochs=%d",
+            task, self.device, self._use_amp, tc.epochs,
         )
 
-    # ─── Abstract interface ───────────────────────────────────────────────────
+    # ── Scheduler factory ─────────────────────────────────────────────────────
 
-    @abstractmethod
-    def _train_step(self, batch: dict[str, Any]) -> torch.Tensor:
+    def _build_scheduler(
+        self, name: str, epochs: int
+    ) -> lr_scheduler.LRScheduler | None:
+        if name == "cosine":
+            return lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=epochs, eta_min=1e-6
+            )
+        if name == "step":
+            return lr_scheduler.StepLR(
+                self.optimizer, step_size=max(1, epochs // 3), gamma=0.1
+            )
+        if name == "plateau":
+            return lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode="max", patience=5, factor=0.5
+            )
+        logger.warning("Unknown scheduler '%s' — no scheduler used.", name)
+        return None
+
+    # ── Main training loop ────────────────────────────────────────────────────
+
+    def train(self) -> dict[str, Any]:
         """
-        Process one batch in training mode.
-
-        Args:
-            batch: Dict from the DataLoader (image, label, mask, metadata).
+        Run the full training loop.
 
         Returns:
-            Scalar loss tensor.  Do **not** call ``.backward()`` here;
-            the base trainer handles gradient accumulation.
+            Dict with ``'best_metric'``, ``'best_epoch'``,
+            ``'best_checkpoint'``, and final ``'history'`` list.
         """
+        tc = self.config.training
+        history: list[dict[str, Any]] = []
+        best_epoch = 0
 
-    @abstractmethod
-    def _val_step(self, batch: dict[str, Any]) -> torch.Tensor:
-        """
-        Process one batch in evaluation mode.
-
-        Args:
-            batch: Dict from the DataLoader.
-
-        Returns:
-            Scalar loss tensor (no grad required).
-        """
-
-    @abstractmethod
-    def _get_monitor_value(self) -> float:
-        """
-        Extract the scalar value of ``config.monitor_metric`` from the
-        latest computed validation metrics.  Used by early stopping and
-        checkpoint manager.
-        """
-
-    # ─── Main training loop ───────────────────────────────────────────────────
-
-    def train(self) -> None:
-        """
-        Run the full training loop from :attr:`start_epoch` to ``config.epochs``.
-        """
-        logger.info("Starting training from epoch %d.", self.start_epoch)
-        for epoch in range(self.start_epoch, self.config.epochs):
+        for epoch in range(tc.epochs):
             t0 = time.time()
 
             # ── Train ─────────────────────────────────────────────────────────
-            self._pre_train_epoch(epoch)
-            train_loss = self._train_epoch(epoch)
-            train_metrics = self._compute_train_metrics()
-            self._post_train_epoch(epoch)
+            train_loss = self._train_epoch()
+            train_metrics = self._train_metrics.compute()
+            self._train_metrics.reset()
 
             # ── Validate ──────────────────────────────────────────────────────
-            val_loss = self._val_epoch(epoch)
-            val_metrics = self._compute_val_metrics()
+            val_loss = self._val_epoch()
+            val_metrics = self._val_metrics.compute()
+            self._val_metrics.reset()
 
             # ── Scheduler step ────────────────────────────────────────────────
-            if self.scheduler and not self._per_step_scheduler:
-                if isinstance(self.scheduler, lr_scheduler.ReduceLROnPlateau):
-                    monitor_val = self._get_monitor_value()
-                    self.scheduler.step(monitor_val)
+            monitor_val = val_metrics.get(
+                tc.monitor.replace("val_", ""), list(val_metrics.values())[0]
+            )
+            if self._scheduler:
+                if isinstance(self._scheduler, lr_scheduler.ReduceLROnPlateau):
+                    self._scheduler.step(monitor_val)
                 else:
-                    self.scheduler.step()
+                    self._scheduler.step()
 
-            # ── Current LR ────────────────────────────────────────────────────
             current_lr = self.optimizer.param_groups[0]["lr"]
+            elapsed    = round(time.time() - t0, 2)
 
-            # ── Logging ───────────────────────────────────────────────────────
-            epoch_metrics = {
-                "epoch": epoch,
-                "train_loss": round(train_loss, 6),
-                "val_loss": round(val_loss, 6),
-                "lr": current_lr,
-                "epoch_time_s": round(time.time() - t0, 2),
+            # ── Build epoch record ────────────────────────────────────────────
+            record: dict[str, Any] = {
+                "epoch":       epoch,
+                "train_loss":  round(train_loss, 6),
+                "val_loss":    round(val_loss, 6),
+                "lr":          current_lr,
+                "epoch_time_s": elapsed,
                 **{f"train_{k}": round(v, 6) for k, v in train_metrics.items()},
-                **{f"val_{k}": round(v, 6) for k, v in val_metrics.items()},
+                **{f"val_{k}":   round(v, 6) for k, v in val_metrics.items()},
             }
-            self._log_epoch(epoch, epoch_metrics)
-            self._log_to_tb(epoch, epoch_metrics)
+            history.append(record)
+
+            # ── Log ───────────────────────────────────────────────────────────
+            self._log_epoch(epoch, record)
 
             # ── Checkpoint ────────────────────────────────────────────────────
-            monitor_val = self._get_monitor_value()
-            self.checkpoint_manager.save(
-                epoch=epoch,
-                metric_value=monitor_val,
-                model=self._unwrap_model(),
-                optimizer=self.optimizer,
-                extra={
-                    "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
-                    "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
-                    "early_stopping_state": self.early_stopper.state_dict(),
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "val_metrics": val_metrics,
-                    "config": self.config.model_dump(),
-                },
+            is_best = monitor_val > self._best_metric
+            if is_best:
+                self._best_metric = monitor_val
+                best_epoch        = epoch
+                save_checkpoint(
+                    self._best_path, self.model, self.optimizer,
+                    epoch, val_metrics, {}
+                )
+            save_checkpoint(
+                self._latest_path, self.model, self.optimizer,
+                epoch, val_metrics, {}
             )
 
             logger.info(
-                "Epoch %d/%d | train_loss=%.4f | val_loss=%.4f | %s=%.4f | lr=%.2e | %.1fs",
-                epoch + 1, self.config.epochs,
-                train_loss, val_loss,
-                self.config.monitor_metric, monitor_val,
-                current_lr,
-                time.time() - t0,
+                "Epoch %03d/%03d | train_loss=%.4f val_loss=%.4f "
+                "monitor=%.4f lr=%.2e | %ss",
+                epoch + 1, tc.epochs, train_loss, val_loss,
+                monitor_val, current_lr, elapsed,
             )
 
-            # ── Early stopping ─────────────────────────────────────────────────
-            if self.config.early_stopping.enabled:
-                if self.early_stopper(monitor_val):
-                    logger.info(
-                        "Early stopping triggered at epoch %d (best=%.4f).",
-                        epoch + 1, self.early_stopper.best_value,
-                    )
-                    break
+            # ── Early stopping ────────────────────────────────────────────────
+            if self._stopper(monitor_val):
+                logger.info(
+                    "Early stopping triggered at epoch %d "
+                    "(patience=%d).", epoch, tc.patience
+                )
+                break
 
-        logger.info("Training complete.")
         if self._tb_writer:
             self._tb_writer.close()
 
-    # ─── Epoch loops ─────────────────────────────────────────────────────────
+        return {
+            "best_metric":     self._best_metric,
+            "best_epoch":      best_epoch,
+            "best_checkpoint": str(self._best_path),
+            "history":         history,
+        }
 
-    def _train_epoch(self, epoch: int) -> float:
+    # ── Train / val epochs ────────────────────────────────────────────────────
+
+    def _train_epoch(self) -> float:
         self.model.train()
         total_loss = 0.0
-        self.optimizer.zero_grad()
 
-        for step, batch in enumerate(self.train_loader):
-            ctx = torch.amp.autocast(
+        for batch in self.train_loader:
+            images = batch["image"].to(self.device)
+            labels = batch["label"].to(self.device)
+
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(
                 device_type=self._device_type, enabled=self._use_amp
-            )
-            with ctx:
-                loss = self._train_step(batch)
-                loss = loss / self.config.grad_accum_steps
+            ):
+                logits = self.model(images)
+                loss   = self.criterion(logits, labels)
 
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
+            if self._scaler:
+                self._scaler.scale(loss).backward()
+                self._scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.training.grad_clip
+                )
+                self._scaler.step(self.optimizer)
+                self._scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.training.grad_clip
+                )
+                self.optimizer.step()
 
-            is_accum = (step + 1) % self.config.grad_accum_steps == 0
-            is_last = (step + 1) == len(self.train_loader)
-
-            if is_accum or is_last:
-                if self.config.grad_clip > 0:
-                    if self.scaler is not None:
-                        self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip
-                    )
-
-                if self.scaler is not None:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
-
-                self.optimizer.zero_grad()
-                self.global_step += 1
-
-                if self._per_step_scheduler and self.scheduler:
-                    self.scheduler.step()
-
-            total_loss += loss.item() * self.config.grad_accum_steps
+            total_loss += loss.item()
+            self._update_metrics(self._train_metrics, logits, labels)
 
         return total_loss / max(len(self.train_loader), 1)
 
     @torch.no_grad()
-    def _val_epoch(self, epoch: int) -> float:
+    def _val_epoch(self) -> float:
         self.model.eval()
         total_loss = 0.0
 
         for batch in self.val_loader:
-            loss = self._val_step(batch)
+            images = batch["image"].to(self.device)
+            labels = batch["label"].to(self.device)
+
+            with torch.amp.autocast(
+                device_type=self._device_type, enabled=self._use_amp
+            ):
+                logits = self.model(images)
+                loss   = self.criterion(logits, labels)
+
             total_loss += loss.item()
+            self._update_metrics(self._val_metrics, logits, labels)
 
         return total_loss / max(len(self.val_loader), 1)
 
-    # ─── Hooks (override for custom behaviour) ────────────────────────────────
-
-    def _pre_train_epoch(self, epoch: int) -> None:
-        """Called at the start of each training epoch."""
-
-    def _post_train_epoch(self, epoch: int) -> None:
-        """Called at the end of each training epoch."""
-
-    def _compute_train_metrics(self) -> dict[str, float]:
-        """Return training metrics after one epoch.  Override in subclass."""
-        return {}
-
-    def _compute_val_metrics(self) -> dict[str, float]:
-        """Return validation metrics after one epoch.  Override in subclass."""
-        return {}
-
-    # ─── Utilities ────────────────────────────────────────────────────────────
-
-    def _build_optimizer(self, cfg: OptimizerConfig) -> optim.Optimizer:
-        params = self._unwrap_model().parameters()
-        name = cfg.name.lower()
-        if name == "adamw":
-            return optim.AdamW(
-                params,
-                lr=cfg.lr,
-                weight_decay=cfg.weight_decay,
-                betas=cfg.betas,
-                eps=cfg.eps,
-            )
-        elif name == "adam":
-            return optim.Adam(
-                params,
-                lr=cfg.lr,
-                weight_decay=cfg.weight_decay,
-                betas=cfg.betas,
-                eps=cfg.eps,
-            )
-        elif name == "sgd":
-            return optim.SGD(
-                params,
-                lr=cfg.lr,
-                momentum=cfg.momentum,
-                weight_decay=cfg.weight_decay,
-                nesterov=True,
-            )
-        elif name == "rmsprop":
-            return optim.RMSprop(
-                params, lr=cfg.lr, weight_decay=cfg.weight_decay
-            )
-        raise ValueError(f"Unknown optimizer: '{cfg.name}'")
-
-    def _unwrap_model(self) -> nn.Module:
-        """Return the underlying model, unwrapping DataParallel if present."""
-        if isinstance(self.model, nn.DataParallel):
-            return self.model.module
-        return self.model
-
-    def _resume(self, path: Path) -> int:
-        """
-        Load training state from a checkpoint.
-
-        Returns:
-            The epoch to resume from (last saved epoch + 1).
-        """
-        if not path.exists():
-            raise FileNotFoundError(f"Resume checkpoint not found: {path}")
-
-        ckpt: dict = torch.load(path, map_location="cpu", weights_only=False)
-        self._unwrap_model().load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-
-        if "scheduler_state_dict" in ckpt and ckpt["scheduler_state_dict"] and self.scheduler:
-            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-
-        if "scaler_state_dict" in ckpt and ckpt["scaler_state_dict"] and self.scaler:
-            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
-
-        if "early_stopping_state" in ckpt and ckpt["early_stopping_state"]:
-            self.early_stopper.load_state_dict(ckpt["early_stopping_state"])
-
-        epoch = ckpt.get("epoch", 0)
-        logger.info("Resumed from %s at epoch %d.", path.name, epoch)
-        return epoch + 1
-
-    def _log_epoch(
-        self, epoch: int, metrics: dict[str, Any]
+    def _update_metrics(
+        self,
+        metrics: ClassificationMetrics | SegmentationMetrics,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
     ) -> None:
-        """Write one row to the CSV log file."""
-        if self._csv_logger is None:
-            self._csv_logger = _CSVLogger(
-                self.config.log_dir / self.config.experiment_name / "training_log.csv",
-                fieldnames=list(metrics.keys()),
-            )
-        self._csv_logger.log(metrics)
+        """Convert logits to probabilities and update metric accumulators."""
+        if self.task == "segmentation":
+            metrics.update(logits, labels)  # type: ignore[arg-type]
+        elif self.task in ("binary", "multiclass"):
+            probs = torch.softmax(logits, dim=1) if self.task == "multiclass" \
+                    else torch.sigmoid(logits).squeeze(1)
+            metrics.update(probs, labels)   # type: ignore[arg-type]
 
-    def _log_to_tb(self, epoch: int, metrics: dict[str, Any]) -> None:
-        """Write scalars to TensorBoard."""
-        if self._tb_writer is None:
-            return
-        for k, v in metrics.items():
-            if isinstance(v, (int, float)):
-                self._tb_writer.add_scalar(k, v, global_step=epoch)
+    # ── Logging ───────────────────────────────────────────────────────────────
+
+    def _log_epoch(self, epoch: int, record: dict[str, Any]) -> None:
+        # TensorBoard
+        if self._tb_writer:
+            for key, val in record.items():
+                if isinstance(val, float):
+                    self._tb_writer.add_scalar(key, val, epoch)
+
+        # CSV (lazy init)
+        if self._csv_logger is None:
+            csv_path = Path(self.config.training.log_dir) / "training_log.csv"
+            self._csv_logger = _CSVLogger(csv_path, list(record.keys()))
+        self._csv_logger.log(record)

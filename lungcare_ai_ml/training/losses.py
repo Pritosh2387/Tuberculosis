@@ -11,9 +11,8 @@ Segmentation losses
 - :class:`DiceLoss` — differentiable Dice coefficient loss.
 - :class:`BCEDiceLoss` — weighted BCE + Dice for segmentation.
 
-Training utilities
-------------------
-- :class:`DeepSupervisionLoss` — wraps any criterion for U-Net++ multi-output.
+Factories
+---------
 - :func:`build_classification_loss` — factory from task string.
 - :func:`build_segmentation_loss` — factory from loss type string.
 """
@@ -198,66 +197,6 @@ class BCEDiceLoss(nn.Module):
         return self.bce_weight * bce_loss + self.dice_weight * dice_loss
 
 
-class DeepSupervisionLoss(nn.Module):
-    """
-    Multi-output loss wrapper for U-Net++ deep supervision.
-
-    During training, U-Net++ returns a list of segmentation maps at
-    progressively finer resolutions.  This module resizes the target mask
-    to each output's spatial size, computes the base loss, and returns
-    a weighted sum.
-
-    Args:
-        criterion: Base loss module (e.g. :class:`BCEDiceLoss`).
-        weights: Coefficients for each output level (coarsest → finest).
-            Defaults to uniform weighting.  Will be normalised to sum 1.
-    """
-
-    def __init__(
-        self,
-        criterion: nn.Module,
-        weights: list[float] | None = None,
-    ) -> None:
-        super().__init__()
-        self.criterion = criterion
-        self._weights = weights
-
-    def forward(
-        self,
-        outputs: list[torch.Tensor] | torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            outputs: List of logit maps from the decoder (coarse → fine).
-                If a single tensor is passed, delegates directly to the
-                base criterion.
-            target: Full-resolution binary mask ``(B, 1, H, W)``.
-
-        Returns:
-            Weighted sum of per-level losses.
-        """
-        if not isinstance(outputs, list):
-            return self.criterion(outputs, target)
-
-        n = len(outputs)
-        raw_weights = self._weights if self._weights is not None else [1.0 / n] * n
-        total = sum(raw_weights)
-        weights = [w / total for w in raw_weights]
-
-        loss = torch.tensor(0.0, device=target.device, requires_grad=True)
-        for output, w in zip(outputs, weights):
-            if output.shape[2:] != target.shape[2:]:
-                target_r = F.interpolate(
-                    target.float(), size=output.shape[2:], mode="nearest"
-                )
-            else:
-                target_r = target
-            loss = loss + w * self.criterion(output, target_r)
-
-        return loss
-
-
 # ─── Factories ────────────────────────────────────────────────────────────────
 
 
@@ -301,45 +240,37 @@ def build_segmentation_loss(
     dice_weight: float = 0.5,
     smooth: float = 1.0,
     pos_weight: torch.Tensor | None = None,
-    deep_supervision: bool = False,
-    ds_weights: list[float] | None = None,
 ) -> nn.Module:
     """
-    Build a segmentation loss, optionally wrapping with deep supervision.
+    Build a segmentation loss.
 
     Args:
-        loss_type: ``'dice'``, ``'bce'``, ``'bce_dice'``, or ``'focal_dice'``.
+        loss_type:  ``'dice'``, ``'bce'``, ``'bce_dice'``, or ``'focal_dice'``.
         bce_weight: BCE term weight in combined losses.
         dice_weight: Dice term weight in combined losses.
-        smooth: Dice smoothing constant.
+        smooth:     Dice smoothing constant.
         pos_weight: Positive class weight for BCE.
-        deep_supervision: If ``True``, wrap with :class:`DeepSupervisionLoss`.
-        ds_weights: Per-level weights for deep supervision.
 
     Returns:
-        A :class:`nn.Module` loss (possibly wrapped in DeepSupervisionLoss).
+        A :class:`nn.Module` loss.
     """
     if loss_type == "dice":
-        base: nn.Module = DiceLoss(smooth=smooth)
-    elif loss_type == "bce":
-        base = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    elif loss_type == "focal_dice":
+        return DiceLoss(smooth=smooth)
+    if loss_type == "bce":
+        return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if loss_type == "focal_dice":
         focal = FocalLoss(reduction="mean")
-        dice = DiceLoss(smooth=smooth)
+        dice  = DiceLoss(smooth=smooth)
 
         class _FocalDice(nn.Module):
             def forward(self_, inp: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
                 return 0.5 * focal(inp, tgt) + 0.5 * dice(inp, tgt)
 
-        base = _FocalDice()
-    else:
-        base = BCEDiceLoss(
-            bce_weight=bce_weight,
-            dice_weight=dice_weight,
-            smooth=smooth,
-            pos_weight=pos_weight,
-        )
-
-    if deep_supervision:
-        return DeepSupervisionLoss(criterion=base, weights=ds_weights)
-    return base
+        return _FocalDice()
+    # default: bce_dice
+    return BCEDiceLoss(
+        bce_weight=bce_weight,
+        dice_weight=dice_weight,
+        smooth=smooth,
+        pos_weight=pos_weight,
+    )

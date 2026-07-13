@@ -1,40 +1,30 @@
 """
+evaluation/report_generator.py
+────────────────────────────────
 Structured clinical report generator for LungCare AI.
 
-Given model outputs (classification logits + segmentation masks + CAM
-heatmaps), generates a machine-readable structured report conforming to
-the project's standard JSON schema, plus an optional human-readable
-Markdown / HTML summary.
+Given model outputs (softmax probabilities + optional Grad-CAM heatmap
++ optional segmentation mask path), generates a machine-readable
+JSON-serialisable report matching the project's output schema.
 
 Output schema
 -------------
-.. code-block:: json
-
-    {
-        "status":     "abnormal",
-        "prediction": "Tuberculosis",
-        "confidence": 0.92,
-        "all_scores": {"Healthy": 0.03, "Tuberculosis": 0.92, ...},
-        "findings":   ["Opacity in upper-right lobe", ...],
-        "localization": {
-            "method": "GradCAM",
-            "top_regions": [{"region": "upper-right", "score": 0.87}]
-        },
-        "segmentation": {
-            "dice_estimate": null,
-            "mask_path":     "results/case_001_mask.png"
-        },
-        "scan_comparison": {
-            "deviation_score": 0.31,
-            "comparison_notes": ["Increased opacity vs healthy baseline"]
-        },
-        "timestamp": "2025-01-15T09:32:00Z",
-        "model_version": "resnet50-v1.2"
-    }
+{
+    "case_id":      "patient_001",
+    "status":       "abnormal",
+    "prediction":   "Tuberculosis",
+    "confidence":   0.92,
+    "all_scores":   {"Normal": 0.08, "Tuberculosis": 0.92},
+    "findings":     ["Opacity detected in upper lung zone", ...],
+    "localization": {"method": "GradCAM", "top_regions": [...]},
+    "segmentation": {"mask_path": "outputs/mask.png"},
+    "timestamp":    "2025-01-15T09:32:00Z",
+    "model_version": "v2.0"
+}
 """
-
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,8 +35,9 @@ import torch
 
 logger = logging.getLogger("lungcare.evaluation.report_generator")
 
-
-# ─── Finding templates ────────────────────────────────────────────────────────
+# ─── Clinical finding templates ───────────────────────────────────────────────
+# Template findings per disease class — selected based on the predicted class.
+# These are standard radiological descriptions, not fabricated results.
 
 _FINDING_TEMPLATES: dict[str, list[str]] = {
     "Tuberculosis": [
@@ -75,26 +66,18 @@ _FINDING_TEMPLATES: dict[str, list[str]] = {
         "Bilateral basal predominance",
         "Traction bronchiectasis detected",
     ],
+    "Normal": [
+        "No significant abnormality detected",
+        "Lung fields appear clear",
+        "Normal cardiomediastinal silhouette",
+    ],
+    # Legacy alias
     "Healthy": [
         "No significant abnormality detected",
         "Lung fields appear clear",
         "Normal cardiomediastinal silhouette",
     ],
 }
-
-_ANATOMICAL_REGIONS = [
-    "upper-right",
-    "upper-left",
-    "mid-right",
-    "mid-left",
-    "lower-right",
-    "lower-left",
-    "perihilar",
-    "bilateral",
-]
-
-
-# ─── Heatmap → region analysis ────────────────────────────────────────────────
 
 
 def _analyse_heatmap(
@@ -103,91 +86,56 @@ def _analyse_heatmap(
     threshold: float = 0.4,
 ) -> list[dict[str, Any]]:
     """
-    Map activation peaks in a heatmap to coarse anatomical regions.
+    Map Grad-CAM activation peaks to coarse anatomical regions.
 
-    Divides the heatmap into a 2×3 grid (upper / mid / lower × left / right)
-    and returns the ``top_k`` regions with highest mean activation above
-    *threshold*.
+    Divides the heatmap into a 2×3 grid (upper/mid/lower × left/right)
+    and returns the top_k regions with highest mean activation.
 
     Args:
-        heatmap: Normalised float32 array ``(H, W)`` in ``[0, 1]``.
-        top_k: Maximum number of regions to report.
-        threshold: Minimum mean activation for a region to be reported.
+        heatmap:   Float32 (H, W) array in [0, 1].
+        top_k:     Maximum regions to return.
+        threshold: Minimum mean activation for a region to be included.
 
     Returns:
-        List of ``{'region': str, 'score': float}`` dicts, sorted by score.
+        List of {'region': str, 'score': float} dicts, sorted by score desc.
     """
     H, W = heatmap.shape
-    rows = [(0, H // 3, "upper"), (H // 3, 2 * H // 3, "mid"), (2 * H // 3, H, "lower")]
+    rows = [
+        (0,         H // 3,     "upper"),
+        (H // 3,    2 * H // 3, "mid"),
+        (2 * H // 3, H,         "lower"),
+    ]
     cols = [(0, W // 2, "right"), (W // 2, W, "left")]
 
     regions: list[dict[str, Any]] = []
     for r0, r1, row_name in rows:
         for c0, c1, col_name in cols:
-            patch = heatmap[r0:r1, c0:c1]
-            score = float(patch.mean())
+            score = float(heatmap[r0:r1, c0:c1].mean())
             if score >= threshold:
-                regions.append({"region": f"{row_name}-{col_name}", "score": round(score, 3)})
+                regions.append({"region": f"{row_name}-{col_name}",
+                                "score": round(score, 3)})
 
     regions.sort(key=lambda x: x["score"], reverse=True)
     return regions[:top_k]
 
 
-# ─── Healthy comparison ───────────────────────────────────────────────────────
-
-
-def _compare_to_healthy(
-    pred_features: np.ndarray | None,
-    healthy_features: np.ndarray | None,
-) -> dict[str, Any]:
-    """
-    Compute a deviation score between patient and healthy reference features.
-
-    Uses normalised L2 distance as a simple proxy for pathology severity.
-
-    Args:
-        pred_features: Feature vector from the patient scan.
-        healthy_features: Feature vector from a healthy reference.
-
-    Returns:
-        Dict with ``'deviation_score'`` and ``'comparison_notes'``.
-    """
-    if pred_features is None or healthy_features is None:
-        return {"deviation_score": None, "comparison_notes": []}
-
-    pred_n = pred_features / (np.linalg.norm(pred_features) + 1e-8)
-    ref_n = healthy_features / (np.linalg.norm(healthy_features) + 1e-8)
-    deviation = float(np.linalg.norm(pred_n - ref_n))
-
-    notes: list[str] = []
-    if deviation > 0.8:
-        notes.append("Significant deviation from healthy reference baseline")
-    elif deviation > 0.4:
-        notes.append("Moderate deviation from healthy reference — clinical review advised")
-    else:
-        notes.append("Findings close to healthy reference baseline")
-
-    return {"deviation_score": round(deviation, 4), "comparison_notes": notes}
-
-
-# ─── Main report generator ────────────────────────────────────────────────────
-
+# ─── ReportGenerator ──────────────────────────────────────────────────────────
 
 class ReportGenerator:
     """
     Generates structured LungCare AI clinical reports.
 
     Args:
-        class_names: Disease class names in softmax output order.
-        model_version: Version string embedded in every report.
-        finding_threshold: Minimum confidence for classifying as abnormal.
-        top_findings: Number of template findings to include per prediction.
+        class_names:       Disease class names in softmax output order.
+        model_version:     Version string embedded in every report.
+        finding_threshold: Minimum confidence to classify as abnormal.
+        top_findings:      Number of template findings to include.
     """
 
     def __init__(
         self,
         class_names: list[str],
-        model_version: str = "v1.0",
+        model_version: str = "v2.0",
         finding_threshold: float = 0.5,
         top_findings: int = 3,
     ) -> None:
@@ -196,134 +144,100 @@ class ReportGenerator:
         self.finding_threshold = finding_threshold
         self.top_findings = top_findings
 
-    # ─── Primary API ─────────────────────────────────────────────────────────
-
     def generate(
         self,
         probs: np.ndarray | torch.Tensor,
         heatmap: np.ndarray | None = None,
         mask_path: str | Path | None = None,
-        healthy_features: np.ndarray | None = None,
-        patient_features: np.ndarray | None = None,
         case_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Generate a structured JSON-serialisable report.
 
         Args:
-            probs: Class probability array ``(C,)`` (softmax or sigmoid).
-            heatmap: Normalised CAM / Grad-CAM heatmap ``(H, W)`` in [0,1].
-            mask_path: Path to saved segmentation mask PNG.
-            healthy_features: GAP feature vector from a healthy reference scan.
-            patient_features: GAP feature vector from the patient scan.
-            case_id: Optional patient / case identifier.
+            probs:      Class probability array (C,) from softmax/sigmoid.
+            heatmap:    Optional Grad-CAM heatmap (H, W) float32 in [0, 1].
+            mask_path:  Optional path to saved segmentation mask PNG.
+            case_id:    Optional patient/case identifier string.
 
         Returns:
-            Structured report dict matching the project's output schema.
+            Dict matching the project output schema (JSON-serialisable).
         """
         if isinstance(probs, torch.Tensor):
             probs = probs.detach().cpu().numpy()
-        probs = probs.astype(float)
+        probs = np.asarray(probs, dtype=float)
 
-        # ── Classification ────────────────────────────────────────────────────
-        pred_idx = int(probs.argmax())
+        # Classification
+        pred_idx   = int(probs.argmax())
         pred_class = self.class_names[pred_idx]
         confidence = float(probs[pred_idx])
-        status = "normal" if pred_class == "Healthy" else "abnormal"
+        normal_names = {"Normal", "Healthy"}
+        status = "normal" if pred_class in normal_names else "abnormal"
 
         all_scores = {
             cls: round(float(p), 4)
             for cls, p in zip(self.class_names, probs)
         }
 
-        # ── Findings ──────────────────────────────────────────────────────────
-        templates = _FINDING_TEMPLATES.get(pred_class, [])
-        findings = templates[: self.top_findings]
-
-        # If low confidence, append uncertainty note
+        # Findings from templates
+        findings: list[str] = list(
+            _FINDING_TEMPLATES.get(pred_class, [])[:self.top_findings]
+        )
         if confidence < self.finding_threshold + 0.1:
             findings.append(
-                f"Confidence ({confidence:.0%}) below clinical threshold "
+                f"Confidence ({confidence:.0%}) is below clinical threshold "
                 "— radiologist review recommended."
             )
 
-        # ── Localisation ──────────────────────────────────────────────────────
+        # Localisation from heatmap
         localization: dict[str, Any] = {"method": None, "top_regions": []}
         if heatmap is not None:
             localization["method"] = "GradCAM"
             localization["top_regions"] = _analyse_heatmap(heatmap)
-            # Append region-specific finding
             for region_info in localization["top_regions"][:1]:
                 findings.append(
-                    f"Abnormal activation localised to {region_info['region']} region "
-                    f"(activation score {region_info['score']:.2f})."
+                    f"Abnormal activation localised to "
+                    f"{region_info['region']} region "
+                    f"(score {region_info['score']:.2f})."
                 )
 
-        # ── Segmentation ──────────────────────────────────────────────────────
-        segmentation: dict[str, Any] = {
-            "mask_path": str(mask_path) if mask_path else None,
-        }
-
-        # ── Comparison with healthy scan ──────────────────────────────────────
-        scan_comparison = _compare_to_healthy(patient_features, healthy_features)
-
-        # ── Assemble ──────────────────────────────────────────────────────────
         report: dict[str, Any] = {
-            "case_id": case_id,
-            "status": status,
-            "prediction": pred_class,
-            "confidence": round(confidence, 4),
-            "all_scores": all_scores,
-            "findings": findings,
-            "localization": localization,
-            "segmentation": segmentation,
-            "scan_comparison": scan_comparison,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "case_id":       case_id,
+            "status":        status,
+            "prediction":    pred_class,
+            "confidence":    round(confidence, 4),
+            "all_scores":    all_scores,
+            "findings":      findings,
+            "localization":  localization,
+            "segmentation":  {"mask_path": str(mask_path) if mask_path else None},
+            "timestamp":     datetime.now(timezone.utc).isoformat(),
             "model_version": self.model_version,
         }
 
         logger.info(
-            "Report generated | case=%s | pred=%s | conf=%.2f | status=%s",
+            "Report | case=%s pred=%s conf=%.2f status=%s",
             case_id, pred_class, confidence, status,
         )
         return report
 
-    # ─── Output formatters ────────────────────────────────────────────────────
-
     def to_markdown(self, report: dict[str, Any]) -> str:
-        """
-        Render a structured report as a human-readable Markdown string.
-
-        Args:
-            report: Dict returned by :meth:`generate`.
-
-        Returns:
-            Multi-line Markdown string.
-        """
-        lines: list[str] = [
-            f"# LungCare AI — Clinical Report",
-            f"",
-            f"| Field | Value |",
-            f"|---|---|",
+        """Render a report dict as human-readable Markdown."""
+        lines = [
+            "# LungCare AI — Clinical Report", "",
+            "| Field | Value |", "|---|---|",
             f"| **Case ID** | `{report.get('case_id', 'N/A')}` |",
             f"| **Status** | {report['status'].upper()} |",
             f"| **Prediction** | **{report['prediction']}** |",
             f"| **Confidence** | {report['confidence']:.1%} |",
             f"| **Timestamp** | {report['timestamp']} |",
             f"| **Model** | {report['model_version']} |",
-            f"",
-            f"## Probability Scores",
-            f"",
+            "", "## Probability Scores", "",
         ]
         for cls, score in report["all_scores"].items():
             bar = "█" * int(score * 20)
             lines.append(f"- **{cls}**: {score:.1%}  `{bar}`")
 
-        lines += [
-            f"",
-            f"## Findings",
-            f"",
-        ]
+        lines += ["", "## Findings", ""]
         for finding in report["findings"]:
             lines.append(f"- {finding}")
 
@@ -331,17 +245,6 @@ class ReportGenerator:
             lines += ["", "## Localisation", ""]
             for r in report["localization"]["top_regions"]:
                 lines.append(f"- {r['region']}: score {r['score']:.2f}")
-
-        comp = report["scan_comparison"]
-        if comp.get("deviation_score") is not None:
-            lines += [
-                "",
-                "## Comparison with Healthy Baseline",
-                "",
-                f"- Deviation score: **{comp['deviation_score']:.4f}**",
-            ]
-            for note in comp["comparison_notes"]:
-                lines.append(f"- {note}")
 
         return "\n".join(lines)
 
@@ -355,23 +258,20 @@ class ReportGenerator:
         Save a report to disk as JSON or Markdown.
 
         Args:
-            report: Structured report dict.
-            output_path: Destination file path (extension determines format
-                if ``fmt`` is not specified).
-            fmt: ``'json'`` or ``'markdown'``.
+            report:      Structured report dict.
+            output_path: Destination file path.
+            fmt:         ``'json'`` or ``'markdown'``.
 
         Returns:
-            Resolved :class:`Path` to the saved file.
+            Resolved Path to the saved file.
         """
-        import json
-
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if fmt == "markdown":
             output_path.write_text(self.to_markdown(report), encoding="utf-8")
         else:
-            with open(output_path, "w") as f:
+            with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2, default=str)
 
         logger.info("Report saved → %s", output_path)

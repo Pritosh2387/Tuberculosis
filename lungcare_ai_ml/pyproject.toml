@@ -9,7 +9,7 @@ description = "Explainable deep learning system for chest X-ray and CT scan anal
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "LungCare AI Team" }]
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 keywords = [
     "medical-imaging",
     "deep-learning",
@@ -42,16 +42,15 @@ dependencies = { file = ["requirements.txt"] }
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
-    "configs*",
     "datasets*",
     "models*",
     "training*",
     "evaluation*",
     "inference*",
-    "services*",
+    "api*",
     "utils*",
 ]
-exclude = ["tests*", "docs*", "scripts*", "data*"]
+exclude = ["tests*", "scripts*", "data*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.json", "*.toml"]

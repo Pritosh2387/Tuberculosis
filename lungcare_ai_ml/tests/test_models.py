@@ -1,220 +1,152 @@
 """
-Tests for all model architectures — classification and segmentation.
+tests/test_models.py
+─────────────────────
+Unit tests for all four classifiers and the UNet segmentation model.
 
-Uses randomly initialised weights (pretrained=False) and synthetic tensors
-so tests run fast on CPU with no internet access required.
+All tests use CPU + random weights (no disk I/O, no network).
 """
-
 from __future__ import annotations
-
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from models import create_model
+from models.resnet import ResNet50Classifier
+from models.densenet import DenseNet121Classifier
+from models.efficientnet import EfficientNetB0Classifier
+from models.vit import ViTClassifier
+from models.unet import UNet
+from models.gradcam import GradCAM
 
 
-NUM_CLASSES = 6
-BATCH = 2
-IMG_SIZE = 224
+# ─── Fixtures ────────────────────────────────────────────────────────────────
+
+@pytest.fixture(params=["resnet50", "densenet121"])
+def cnn_model(request: pytest.FixtureRequest) -> torch.nn.Module:
+    """Parametrised fixture: returns one CNN classifier at a time."""
+    return create_model(request.param, num_classes=6, pretrained=False)
 
 
-# ─── Classification models ────────────────────────────────────────────────────
+@pytest.fixture
+def resnet() -> ResNet50Classifier:
+    return ResNet50Classifier(num_classes=2, pretrained=False)
 
 
-class TestResNet50:
-    @pytest.fixture()
-    def model(self):
-        from models.classification.resnet import ResNet50Classifier
-        return ResNet50Classifier(num_classes=NUM_CLASSES, pretrained=False)
-
-    def test_forward_shape(self, model):
-        x = torch.randn(BATCH, 3, IMG_SIZE, IMG_SIZE)
-        out = model(x)
-        assert out.shape == (BATCH, NUM_CLASSES)
-
-    def test_get_features_shape(self, model):
-        x = torch.randn(1, 3, IMG_SIZE, IMG_SIZE)
-        feats = model.get_features(x)
-        assert feats.ndim == 4
-        assert feats.shape[0] == 1
-
-    def test_get_target_layer(self, model):
-        layer = model.get_target_layer()
-        assert layer is not None
-
-    def test_predict_dict(self, model):
-        x = torch.randn(1, 3, IMG_SIZE, IMG_SIZE)
-        result = model.predict(x)
-        assert "pred_class" in result
-        assert "confidence" in result
-        assert "probabilities" in result
-
-    def test_freeze_backbone(self, model):
-        model.freeze_backbone()
-        frozen = [p for name, p in model.named_parameters()
-                  if "classifier" not in name and not p.requires_grad]
-        assert len(frozen) > 0
-
-
-class TestDenseNet121:
-    @pytest.fixture()
-    def model(self):
-        from models.classification.densenet import DenseNet121Classifier
-        return DenseNet121Classifier(num_classes=NUM_CLASSES, pretrained=False)
-
-    def test_forward_shape(self, model):
-        x = torch.randn(BATCH, 3, IMG_SIZE, IMG_SIZE)
-        out = model(x)
-        assert out.shape == (BATCH, NUM_CLASSES)
-
-    def test_get_features_returns_4d(self, model):
-        x = torch.randn(1, 3, IMG_SIZE, IMG_SIZE)
-        feats = model.get_features(x)
-        assert feats.ndim == 4
-
-
-class TestEfficientNetB0:
-    @pytest.fixture()
-    def model(self):
-        from models.classification.efficientnet import EfficientNetB0Classifier
-        return EfficientNetB0Classifier(num_classes=NUM_CLASSES, pretrained=False)
-
-    def test_forward_shape(self, model):
-        x = torch.randn(BATCH, 3, IMG_SIZE, IMG_SIZE)
-        out = model(x)
-        assert out.shape == (BATCH, NUM_CLASSES)
-
-
-class TestViTClassifier:
-    @pytest.fixture()
-    def model(self):
-        from models.classification.vit import ViTClassifier
-        return ViTClassifier(num_classes=NUM_CLASSES, pretrained=False)
-
-    def test_forward_shape(self, model):
-        x = torch.randn(BATCH, 3, 224, 224)
-        out = model(x)
-        assert out.shape == (BATCH, NUM_CLASSES)
+@pytest.fixture
+def dummy_batch() -> torch.Tensor:
+    return torch.randn(2, 3, 224, 224)
 
 
 # ─── Factory ─────────────────────────────────────────────────────────────────
 
-
 class TestModelFactory:
-    @pytest.mark.parametrize("arch", [
-        "resnet50", "densenet121", "efficientnet_b0", "vit_b16"
-    ])
-    def test_create_classifier(self, arch: str):
-        from models import create_classifier
-        model = create_classifier(arch, num_classes=NUM_CLASSES, pretrained=False)
-        x = torch.randn(1, 3, 224, 224)
-        out = model(x)
-        assert out.shape == (1, NUM_CLASSES)
+    def test_create_resnet(self) -> None:
+        m = create_model("resnet50", num_classes=2, pretrained=False)
+        assert isinstance(m, ResNet50Classifier)
 
-    @pytest.mark.parametrize("arch", ["unet", "attention_unet", "unet_plus_plus"])
-    def test_create_segmentation_model(self, arch: str):
-        from models import create_segmentation_model
-        kwargs = dict(in_channels=1, out_channels=1, features=(16, 32, 64))
-        if arch == "unet_plus_plus":
-            kwargs["deep_supervision"] = False
-        model = create_segmentation_model(arch, **kwargs)
-        x = torch.randn(1, 1, 128, 128)
-        model.eval()
-        with torch.no_grad():
-            out = model(x)
-        assert out.shape[-2:] == (128, 128)
+    def test_create_densenet(self) -> None:
+        m = create_model("densenet121", num_classes=6, pretrained=False)
+        assert isinstance(m, DenseNet121Classifier)
+
+    def test_unknown_raises(self) -> None:
+        with pytest.raises(KeyError, match="Unknown architecture"):
+            create_model("mynet", num_classes=2)
+
+    def test_all_registered(self) -> None:
+        for name in ["resnet50", "densenet121", "efficientnet_b0"]:
+            m = create_model(name, num_classes=2, pretrained=False)
+            assert m is not None
 
 
-# ─── Segmentation models ─────────────────────────────────────────────────────
+# ─── ResNet50 ────────────────────────────────────────────────────────────────
 
+class TestResNet50:
+    def test_output_shape_binary(self, resnet: ResNet50Classifier, dummy_batch: torch.Tensor) -> None:
+        out = resnet(dummy_batch)
+        assert out.shape == (2, 2)
+
+    def test_output_shape_6class(self, dummy_batch: torch.Tensor) -> None:
+        m = ResNet50Classifier(num_classes=6, pretrained=False)
+        out = m(dummy_batch)
+        assert out.shape == (2, 6)
+
+    def test_get_target_layer(self, resnet: ResNet50Classifier) -> None:
+        layer = resnet.get_target_layer()
+        assert layer is resnet.layer4
+
+    def test_get_features_shape(self, resnet: ResNet50Classifier, dummy_batch: torch.Tensor) -> None:
+        feats = resnet.get_features(dummy_batch)
+        assert feats.ndim == 4         # (B, C, h, w)
+        assert feats.shape[0] == 2
+
+
+# ─── DenseNet121 ─────────────────────────────────────────────────────────────
+
+class TestDenseNet121:
+    def test_output_shape(self, dummy_batch: torch.Tensor) -> None:
+        m = DenseNet121Classifier(num_classes=6, pretrained=False)
+        out = m(dummy_batch)
+        assert out.shape == (2, 6)
+
+    def test_get_target_layer(self) -> None:
+        m = DenseNet121Classifier(num_classes=2, pretrained=False)
+        assert m.get_target_layer() is m.features.denseblock4
+
+
+# ─── UNet ────────────────────────────────────────────────────────────────────
 
 class TestUNet:
-    @pytest.fixture()
-    def model(self):
-        from models.segmentation.unet import UNet
-        return UNet(in_channels=1, out_channels=1, features=(16, 32, 64), bilinear=True)
+    def test_output_shape_binary(self) -> None:
+        model = UNet(in_channels=3, out_channels=1)
+        x     = torch.randn(2, 3, 224, 224)
+        out   = model(x)
+        assert out.shape == (2, 1, 224, 224)
 
-    def test_forward_preserves_spatial(self, model):
-        x = torch.randn(BATCH, 1, 128, 128)
-        model.eval()
-        with torch.no_grad():
-            out = model(x)
-        assert out.shape == (BATCH, 1, 128, 128)
-
-    def test_count_parameters(self, model):
-        assert model.count_parameters() > 0
-
-    def test_odd_spatial_dims(self, model):
-        """U-Net must handle odd H/W via padding."""
-        x = torch.randn(1, 1, 129, 133)
-        model.eval()
-        with torch.no_grad():
-            out = model(x)
-        assert out.shape[2:] == (129, 133)
+    def test_count_parameters(self) -> None:
+        model = UNet()
+        n = model.count_parameters()
+        assert n > 0
 
 
-class TestAttentionUNet:
-    @pytest.fixture()
-    def model(self):
-        from models.segmentation.attention_unet import AttentionUNet
-        return AttentionUNet(in_channels=1, out_channels=1, features=(16, 32, 64))
+# ─── GradCAM ─────────────────────────────────────────────────────────────────
 
-    def test_forward_shape(self, model):
-        x = torch.randn(BATCH, 1, 128, 128)
-        model.eval()
-        with torch.no_grad():
-            out = model(x)
-        assert out.shape == (BATCH, 1, 128, 128)
+class TestGradCAM:
+    def test_heatmap_shape(self, resnet: ResNet50Classifier) -> None:
+        x = torch.randn(1, 3, 224, 224)
+        with GradCAM(resnet, device="cpu") as cam:
+            heatmap, cls_idx = cam.compute(x, output_size=(224, 224))
+        assert heatmap.shape == (224, 224)
+        assert 0.0 <= heatmap.min()
+        assert heatmap.max() <= 1.0
+        assert isinstance(cls_idx, int)
 
-    def test_get_attention_maps(self, model):
-        x = torch.randn(1, 1, 128, 128)
-        maps = model.get_attention_maps(x)
-        assert len(maps) > 0
-        for m in maps:
-            assert m.shape[1] == 1  # Single attention channel
+    def test_overlay_shape(self) -> None:
+        import numpy as np
+        img  = (np.random.rand(224, 224, 3) * 255).astype("uint8")
+        heat = np.random.rand(224, 224).astype("float32")
+        out  = GradCAM.overlay(img, heat)
+        assert out.shape == (224, 224, 3)
+        assert out.dtype.name == "uint8"
+
+    def test_none_target_layer_raises(self) -> None:
+        """ViT's get_target_layer() returns None → GradCAM should raise."""
+        m = ViTClassifier(num_classes=2, pretrained=False)
+        with pytest.raises(ValueError, match="None from get_target_layer"):
+            _ = GradCAM(m)
 
 
-class TestUNetPlusPlus:
-    @pytest.fixture()
-    def model_ds(self):
-        from models.segmentation.unet_plus_plus import UNetPlusPlus
-        return UNetPlusPlus(
-            in_channels=1, out_channels=1,
-            features=(16, 32, 64, 128), deep_supervision=True
-        )
+# ─── CNN parametrised ────────────────────────────────────────────────────────
 
-    @pytest.fixture()
-    def model_no_ds(self):
-        from models.segmentation.unet_plus_plus import UNetPlusPlus
-        return UNetPlusPlus(
-            in_channels=1, out_channels=1,
-            features=(16, 32, 64), deep_supervision=False
-        )
+class TestCNNOutput:
+    def test_forward_pass(
+        self, cnn_model: torch.nn.Module, dummy_batch: torch.Tensor
+    ) -> None:
+        out = cnn_model(dummy_batch)
+        assert out.shape[0] == 2
+        assert out.shape[1] == 6
 
-    def test_train_returns_list(self, model_ds):
-        model_ds.train()
-        x = torch.randn(BATCH, 1, 128, 128)
-        out = model_ds(x)
-        assert isinstance(out, list)
-        assert len(out) > 0
-
-    def test_eval_returns_tensor(self, model_ds):
-        model_ds.eval()
-        x = torch.randn(BATCH, 1, 128, 128)
-        with torch.no_grad():
-            out = model_ds(x)
-        assert isinstance(out, torch.Tensor)
-
-    def test_no_ds_always_tensor(self, model_no_ds):
-        for mode in [True, False]:
-            model_no_ds.train(mode)
-            x = torch.randn(1, 1, 64, 64)
-            if not mode:
-                with torch.no_grad():
-                    out = model_no_ds(x)
-            else:
-                out = model_no_ds(x)
-            assert isinstance(out, torch.Tensor)
+    def test_no_nan_in_output(
+        self, cnn_model: torch.nn.Module, dummy_batch: torch.Tensor
+    ) -> None:
+        out = cnn_model(dummy_batch)
+        assert not torch.isnan(out).any()

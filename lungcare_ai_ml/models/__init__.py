@@ -1,146 +1,57 @@
 """
-Public API for the LungCare AI ``models`` package.
+models/__init__.py
+───────────────────
+Model factory for LungCare AI.
 
-Provides a :func:`create_classifier` factory and re-exports the most
-commonly used symbols from each sub-package.
+Single entry point: ``create_model(name, **kwargs)`` returns a
+classifier. Imports are lazy (inside the factory function) to avoid
+the broken torchvision→torch.onnx→transformers chain at collection time.
+
+Registered classifiers
+-----------------------
+  resnet50         → ResNet50Classifier
+  densenet121      → DenseNet121Classifier
+  efficientnet_b0  → EfficientNetB0Classifier
+  vit_b16          → ViTClassifier
 """
-
 from __future__ import annotations
-
-# Apply the torch/transformers pytree compatibility shim before any import
-# that transitively loads ``transformers`` via ``torchvision`` (see
-# :mod:`utils.torch_compat`).  Idempotent and a no-op on modern torch.
-from utils.torch_compat import ensure_pytree_compat as _ensure_pytree_compat
-
-_ensure_pytree_compat()
 
 from typing import Any
 
-from models.classification import (
-    BaseClassifier,
-    DenseNet121Classifier,
-    EfficientNetB0Classifier,
-    ResNet50Classifier,
-    ViTClassifier,
-)
-from models.explainability import (
-    CAM,
-    AttentionHeatmap,
-    AttentionRollout,
-    GradCAM,
-    GradCAMPlusPlus,
-)
-from models.segmentation import AttentionUNet, UNet, UNetPlusPlus
-
-_CLASSIFIER_REGISTRY: dict[str, type[BaseClassifier]] = {
-    "resnet50": ResNet50Classifier,
-    "densenet121": DenseNet121Classifier,
-    "efficientnet_b0": EfficientNetB0Classifier,
-    "vit_b16": ViTClassifier,
-}
-
-_SEGMENTATION_REGISTRY: dict[str, type] = {
-    "unet": UNet,
-    "attention_unet": AttentionUNet,
-    "unet_plus_plus": UNetPlusPlus,
+_REGISTRY: dict[str, str] = {
+    "resnet50":        "models.resnet.ResNet50Classifier",
+    "densenet121":     "models.densenet.DenseNet121Classifier",
+    "efficientnet_b0": "models.efficientnet.EfficientNetB0Classifier",
+    "vit_b16":         "models.vit.ViTClassifier",
 }
 
 
-def create_classifier(name: str, **kwargs: Any) -> BaseClassifier:
+def create_model(name: str, **kwargs: Any) -> Any:
     """
-    Instantiate a classifier by name.
+    Instantiate a classifier by name (lazy import — models loaded on demand).
 
     Args:
-        name: Architecture name.  One of ``'resnet50'``, ``'densenet121'``,
-            ``'efficientnet_b0'``, ``'vit_b16'``.
-        **kwargs: Forwarded to the constructor.
+        name:     Architecture key. One of: resnet50, densenet121,
+                  efficientnet_b0, vit_b16.
+        **kwargs: Forwarded to the model constructor
+                  (num_classes, pretrained, dropout_rate, …).
 
     Returns:
-        A :class:`BaseClassifier` instance.
+        Instantiated model with forward(), get_features(), get_target_layer().
 
     Raises:
-        KeyError: If *name* is not registered.
-
-    Example::
-
-        model = create_classifier("resnet50", num_classes=6, pretrained=True)
+        KeyError: Unknown architecture name.
     """
-    if name not in _CLASSIFIER_REGISTRY:
+    if name not in _REGISTRY:
         raise KeyError(
-            f"Unknown classifier '{name}'. "
-            f"Available: {list(_CLASSIFIER_REGISTRY)}"
+            f"Unknown architecture '{name}'. "
+            f"Available: {sorted(_REGISTRY)}"
         )
-    return _CLASSIFIER_REGISTRY[name](**kwargs)
+    module_path, class_name = _REGISTRY[name].rsplit(".", 1)
+    import importlib
+    module = importlib.import_module(module_path)
+    cls    = getattr(module, class_name)
+    return cls(**kwargs)
 
 
-def create_segmentation_model(name: str, **kwargs: Any) -> Any:
-    """
-    Instantiate a segmentation model by name.
-
-    Args:
-        name: Architecture name.  One of ``'unet'``, ``'attention_unet'``,
-            ``'unet_plus_plus'``.
-        **kwargs: Forwarded to the constructor.
-
-    Returns:
-        A segmentation model instance.
-    """
-    if name not in _SEGMENTATION_REGISTRY:
-        raise KeyError(
-            f"Unknown segmentation model '{name}'. "
-            f"Available: {list(_SEGMENTATION_REGISTRY)}"
-        )
-    return _SEGMENTATION_REGISTRY[name](**kwargs)
-
-
-def get_explainability(
-    method: str,
-    model: BaseClassifier,
-    **kwargs: Any,
-) -> Any:
-    """
-    Instantiate an explainability method by name.
-
-    Args:
-        method: One of ``'cam'``, ``'gradcam'``, ``'gradcam++'``,
-            ``'rollout'``, ``'attn_heatmap'``.
-        model: A classifier instance.
-        **kwargs: Forwarded to the explainability class.
-
-    Returns:
-        An explainability object.
-    """
-    registry: dict[str, type] = {
-        "cam": CAM,
-        "gradcam": GradCAM,
-        "gradcam++": GradCAMPlusPlus,
-        "rollout": AttentionRollout,
-        "attn_heatmap": AttentionHeatmap,
-    }
-    if method not in registry:
-        raise KeyError(f"Unknown method '{method}'. Available: {list(registry)}")
-    return registry[method](model, **kwargs)
-
-
-__all__ = [
-    # Classifiers
-    "BaseClassifier",
-    "ResNet50Classifier",
-    "DenseNet121Classifier",
-    "EfficientNetB0Classifier",
-    "ViTClassifier",
-    # Segmentation
-    "UNet",
-    "AttentionUNet",
-    "UNetPlusPlus",
-    # Explainability
-    "CAM",
-    "GradCAM",
-    "GradCAMPlusPlus",
-    "AttentionRollout",
-    "AttentionHeatmap",
-    # Factories
-    "create_classifier",
-    "create_segmentation_model",
-    "get_explainability",
-]
+__all__ = ["create_model"]

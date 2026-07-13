@@ -26,7 +26,6 @@ import logging
 from typing import Any
 
 import torch
-import torchmetrics
 
 logger = logging.getLogger("lungcare.training.metrics")
 
@@ -63,7 +62,8 @@ class ClassificationMetrics:
         task: str,
         num_classes: int,
         device: str | torch.device,
-    ) -> torchmetrics.MetricCollection:
+    ) -> "torchmetrics.MetricCollection":
+        import torchmetrics  # lazy import — avoids compatibility issues at module load
         if task == "binary":
             metrics: dict[str, torchmetrics.Metric] = {
                 "accuracy": torchmetrics.Accuracy(task="binary"),
@@ -103,14 +103,12 @@ class ClassificationMetrics:
                     average="macro",
                 ),
             }
-            # Separate per-class F1 for clinical interpretability
-            for i in range(num_classes):
-                name = self.class_names[i] if self.class_names else str(i)
-                metrics[f"f1_{name}"] = torchmetrics.F1Score(
-                    task="multiclass",
-                    num_classes=num_classes,
-                    average="none",
-                )
+        # Per-class F1 — ONE metric, expanded to named keys in compute()
+            metrics["f1_per_class"] = torchmetrics.F1Score(
+                task="multiclass",
+                num_classes=num_classes,
+                average="none",
+            )
 
         elif task == "multilabel":
             metrics = {
@@ -175,12 +173,12 @@ class ClassificationMetrics:
 
         for k, v in raw.items():
             tensor_val = v.cpu()
-            if tensor_val.ndim == 0:
-                result[k] = float(tensor_val.item())
-            elif tensor_val.ndim == 1 and k.startswith("f1_") and self.task == "multiclass":
-                # Per-class F1 vector → expand to named keys
+            if k == "f1_per_class" and tensor_val.ndim == 1:
+                # Expand per-class vector into named keys
                 for idx, cls_name in enumerate(self.class_names):
                     result[f"f1_{cls_name}"] = float(tensor_val[idx].item())
+            elif tensor_val.ndim == 0:
+                result[k] = float(tensor_val.item())
             else:
                 result[k] = float(tensor_val.mean().item())
 
@@ -230,19 +228,17 @@ class SegmentationMetrics:
         threshold: float = 0.5,
         device: str | torch.device = "cpu",
     ) -> None:
+        import torchmetrics  # lazy import
+
         self.num_classes = num_classes
         self.threshold = threshold
         self.device = device
 
-        # NOTE: ``torchmetrics.Dice`` was removed in torchmetrics>=1.6.  For
-        # segmentation the Dice coefficient is identical to the F1 score
-        # (2·TP / (2·TP + FP + FN)), so F1Score is used as a drop-in that keeps
-        # the ``dice`` output key and is available across torchmetrics versions.
         if num_classes == 1:
             tm_task = "binary"
             self._dice = torchmetrics.F1Score(task="binary").to(device)
-            self._iou = torchmetrics.JaccardIndex(task="binary").to(device)
-            self._acc = torchmetrics.Accuracy(task="binary").to(device)
+            self._iou  = torchmetrics.JaccardIndex(task="binary").to(device)
+            self._acc  = torchmetrics.Accuracy(task="binary").to(device)
         else:
             tm_task = "multiclass"
             self._dice = torchmetrics.F1Score(
